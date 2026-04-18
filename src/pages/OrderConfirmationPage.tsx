@@ -36,7 +36,12 @@ const generateEventId = () => {
 const OrderConfirmationPage = () => {
   const location = useLocation();
   const navigate = useNavigate();
-  
+
+  // EPS redirects with query params: ?MerchantTransactionId=...&EPSTransactionId=...&Status=Success
+  const queryParams = new URLSearchParams(location.search);
+  const epsMerchantTxnId = queryParams.get('MerchantTransactionId') || queryParams.get('merchantTransactionId');
+  const epsTxnId = queryParams.get('EPSTransactionId') || queryParams.get('epsTransactionId');
+
   // Try location state first, then sessionStorage (for payment gateway redirect)
   const stateFromNav = location.state as OrderDetails | null;
   const state = stateFromNav || (() => {
@@ -57,7 +62,7 @@ const OrderConfirmationPage = () => {
   const { isReady: pixelReady, setUserData } = useFacebookPixel();
   const { trackPurchase: trackServerPurchase } = useServerTracking();
 
-  const orderNumber = state?.orderNumber || "";
+  const orderNumber = state?.orderNumber || epsMerchantTxnId || "";
   const customerName = state?.customerName;
   const phone = state?.phone;
   const total = state?.total;
@@ -68,30 +73,32 @@ const OrderConfirmationPage = () => {
   const fromLandingPage = state?.fromLandingPage;
   const landingPageSlug = state?.landingPageSlug;
   const customerEmail = state?.customerEmail;
-  const hasSentEmailRef = useRef(false);
+  const hasVerifiedRef = useRef(false);
 
-  // 0) Confirm payment & send delivery email via server-side edge function
+  // 0) Verify payment with EPS server-side, then send digital delivery email
   useEffect(() => {
-    if (!orderNumber || !customerEmail || hasSentEmailRef.current) return;
-    hasSentEmailRef.current = true;
+    if (!orderNumber || hasVerifiedRef.current) return;
+    if (!epsMerchantTxnId && !customerEmail) return;
+    hasVerifiedRef.current = true;
 
     const productName = items.map(i => i.productName).join(', ') || 'AI Prompt Mastery (PDF)';
 
-    supabase.functions.invoke('confirm-payment', {
+    supabase.functions.invoke('eps-verify', {
       body: {
-        order_number: orderNumber,
+        merchant_transaction_id: orderNumber,
+        eps_transaction_id: epsTxnId || undefined,
         customer_email: customerEmail,
         customer_name: customerName || '',
         product_name: productName,
         total: total || 0,
       },
     }).then(({ data, error }) => {
-      if (error) console.error('[Payment] Confirm payment failed:', error);
-      else console.log('[Payment] Payment confirmed & email sent:', data);
+      if (error) console.error('[EPS] Verify failed:', error);
+      else console.log('[EPS] Verify result:', data);
     }).catch((err) => {
-      console.error('[Payment] Confirm payment error:', err);
+      console.error('[EPS] Verify error:', err);
     });
-  }, [orderNumber, customerEmail, customerName, items, total]);
+  }, [orderNumber, epsMerchantTxnId, epsTxnId, customerEmail, customerName, items, total]);
 
   // 1) Prepare event id + user data once (fast)
   useEffect(() => {

@@ -467,10 +467,33 @@ const CheckoutPage = () => {
         city: shippingZone === 'inside_dhaka' ? 'dhaka' : 'bangladesh',
         district: shippingZone === 'inside_dhaka' ? 'dhaka' : undefined,
       };
+      // Include billing email so confirmation page can send delivery email
+      (confirmationData as any).customerEmail = billingForm.email?.trim() || undefined;
       sessionStorage.setItem('pending_order_confirmation', JSON.stringify(confirmationData));
 
-      // Redirect to payment gateway
-      window.location.href = 'https://pg.eps.com.bd/DefaultPaymentLink?id=5F5EC3FE';
+      // Initialize EPS payment via direct API
+      const successUrl = `${window.location.origin}/order-confirmation`;
+      const failUrl = `${window.location.origin}/payment-failed`;
+      const initRes = await supabase.functions.invoke('eps-initiate', {
+        body: {
+          order_number: order.id,
+          amount: total,
+          customer_name: billingForm.name || shippingForm.name,
+          customer_email: billingForm.email?.trim() || `noemail+${order.id}@pixelcraftstudio.shop`,
+          customer_phone: billingForm.phone || shippingForm.phone,
+          customer_address: shippingForm.address,
+          product_name: cartItems[0]?.product?.name || 'Order',
+          success_url: successUrl,
+          fail_url: failUrl,
+          cancel_url: failUrl,
+        },
+      });
+
+      if (initRes.error || !initRes.data?.redirectUrl) {
+        throw new Error(initRes.data?.error || initRes.error?.message || 'পেমেন্ট গেটওয়ে সমস্যা');
+      }
+
+      window.location.href = initRes.data.redirectUrl;
     } catch (error) {
       console.error('Order error:', error);
       const msg =
