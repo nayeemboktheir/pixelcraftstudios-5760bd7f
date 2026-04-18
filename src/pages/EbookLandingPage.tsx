@@ -87,7 +87,6 @@ export default function EbookLandingPage() {
       }
 
       // Store order confirmation data for after payment redirect
-      // PDF email will be sent AFTER payment is confirmed (on OrderConfirmationPage)
       const confirmationData = {
         orderNumber: data.orderNumber,
         customerName: billingForm.name,
@@ -104,8 +103,29 @@ export default function EbookLandingPage() {
       };
       sessionStorage.setItem('pending_order_confirmation', JSON.stringify(confirmationData));
 
-      // Redirect to payment gateway
-      window.location.href = 'https://pg.eps.com.bd/DefaultPaymentLink?id=5F5EC3FE';
+      // Initialize EPS payment via direct API
+      const successUrl = `${window.location.origin}/order-confirmation`;
+      const failUrl = `${window.location.origin}/payment-failed`;
+      const initRes = await supabase.functions.invoke('eps-initiate', {
+        body: {
+          order_number: data.orderNumber,
+          amount: data.total,
+          customer_name: billingForm.name,
+          customer_email: billingForm.email.trim(),
+          customer_phone: billingForm.phone || '01000000000',
+          customer_address: 'Digital Delivery',
+          product_name: 'AI Prompt Mastery (PDF)',
+          success_url: successUrl,
+          fail_url: failUrl,
+          cancel_url: failUrl,
+        },
+      });
+
+      if (initRes.error || !initRes.data?.redirectUrl) {
+        throw new Error(initRes.data?.error || initRes.error?.message || 'পেমেন্ট গেটওয়ে সমস্যা');
+      }
+
+      window.location.href = initRes.data.redirectUrl;
     } catch (err: any) {
       toast({
         title: 'অর্ডার ব্যর্থ',
