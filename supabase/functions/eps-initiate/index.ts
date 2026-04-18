@@ -6,19 +6,45 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version',
 };
 
-const EPS_BASE = 'https://pg.eps.com.bd/api'; // EPS production API base
+const EPS_BASE = 'https://pgapi.eps.com.bd/v1';
 
-async function getToken(username: string, password: string): Promise<string> {
-  const resp = await fetch(`${EPS_BASE}/GetToken`, {
+// HMAC-SHA512(key=hashKey-utf8, msg=field) -> base64
+async function makeXHash(hashKey: string, field: string): Promise<string> {
+  const enc = new TextEncoder();
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(hashKey),
+    { name: 'HMAC', hash: 'SHA-512' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(field));
+  // base64 encode
+  const bytes = new Uint8Array(sig);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+async function getToken(username: string, password: string, hashKey: string): Promise<string> {
+  const xHash = await makeXHash(hashKey, username);
+  const resp = await fetch(`${EPS_BASE}/Auth/GetToken`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ UserName: username, Password: password }),
+    headers: {
+      'Content-Type': 'application/json',
+      'x-hash': xHash,
+    },
+    body: JSON.stringify({ userName: username, password }),
   });
   const text = await resp.text();
   let json: any;
-  try { json = JSON.parse(text); } catch { throw new Error(`GetToken bad response: ${text.slice(0,300)}`); }
-  const token = json?.Token || json?.token || json?.access_token || json?.AccessToken;
-  if (!token) throw new Error(`GetToken missing token: ${text.slice(0,300)}`);
+  try { json = JSON.parse(text); } catch {
+    throw new Error(`GetToken bad response (${resp.status}): ${text.slice(0, 400)}`);
+  }
+  const token = json?.token || json?.Token;
+  if (!token) {
+    throw new Error(`GetToken missing token (${resp.status}): ${JSON.stringify(json).slice(0, 400)}`);
+  }
   return token;
 }
 
@@ -60,78 +86,93 @@ Deno.serve(async (req) => {
       });
     }
 
-    // Persist customer_email on the order so verify can deliver later (best-effort)
+    // EPS requires merchantTransactionId minimum 10 chars; pad if needed.
+    let merchantTransactionId = String(order_number);
+    if (merchantTransactionId.length < 10) {
+      merchantTransactionId = (merchantTransactionId + Date.now().toString()).slice(0, 20);
+    }
+
+    // Persist email on order notes so verify can deliver later (best-effort)
     try {
       const sb = createClient(supabaseUrl, serviceKey, {
         auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
       });
-      await sb.from('orders').update({
-        notes: `email:${customer_email}`,
-      }).eq('order_number', order_number);
+      await sb.from('orders')
+        .update({ notes: `email:${customer_email};mtid:${merchantTransactionId}` })
+        .eq('order_number', order_number);
     } catch (e) {
       console.warn('Could not stash email on order notes:', e);
     }
 
-    // 1) Get token
-    const token = await getToken(username, password);
+    // 1) Get bearer token (with x-hash on username)
+    const token = await getToken(username, password, hashKey);
 
-    // 2) Initialize transaction
-    const initBody: Record<string, unknown> = {
-      MerchantId: merchantId,
-      StoreId: storeId,
-      HashKey: hashKey,
-      MerchantTransactionId: order_number,
-      TransactionTypeId: 1,
-      TotalAmount: Number(amount),
-      SuccessUrl: success_url,
-      FailUrl: fail_url || success_url,
-      CancelUrl: cancel_url || fail_url || success_url,
-      CustomerName: customer_name || 'Customer',
-      CustomerEmail: customer_email,
-      CustomerPhone: customer_phone || '01000000000',
-      CustomerAddress: customer_address || 'N/A',
+    // 2) Build init body (exact field names per EPS guide)
+    const initPayload: Record<string, unknown> = {
+      merchantId,
+      storeId,
+      CustomerOrderId: order_number,
+      merchantTransactionId,
+      transactionTypeId: 1,
+      totalAmount: Number(amount),
+      successUrl: success_url,
+      failUrl: fail_url || success_url,
+      cancelUrl: cancel_url || fail_url || success_url,
+      customerName: customer_name || 'Customer',
+      customerEmail: customer_email,
+      CustomerAddress: customer_address || 'Digital Delivery',
       CustomerCity: 'Dhaka',
-      CustomerCountry: 'Bangladesh',
+      CustomerState: 'Dhaka',
+      CustomerPostcode: '1200',
+      CustomerCountry: 'BD',
+      CustomerPhone: customer_phone || '01000000000',
       ProductName: product_name || 'Digital Product',
-      ProductCategory: 'Digital',
       ProductProfile: 'general',
-      Currency: 'BDT',
+      ProductCategory: 'Digital',
+      ShippingMethod: 'NO',
+      NoOfItem: '1',
     };
 
-    const initResp = await fetch(`${EPS_BASE}/InitializeEPS`, {
+    // 3) Build x-hash from merchantTransactionId
+    const xHash = await makeXHash(hashKey, merchantTransactionId);
+
+    const initResp = await fetch(`${EPS_BASE}/EPSEngine/InitializeEPS`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${token}`,
+        'x-hash': xHash,
       },
-      body: JSON.stringify(initBody),
+      body: JSON.stringify(initPayload),
     });
 
     const initText = await initResp.text();
     let initJson: any;
     try { initJson = JSON.parse(initText); } catch {
       console.error('InitializeEPS non-JSON:', initText.slice(0, 500));
-      return new Response(JSON.stringify({ error: 'EPS init returned invalid response', raw: initText.slice(0, 500) }), {
+      return new Response(JSON.stringify({ error: 'EPS init invalid response', status: initResp.status, raw: initText.slice(0, 500) }), {
         status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    const redirectUrl =
-      initJson?.RedirectURL || initJson?.redirectUrl || initJson?.RedirectUrl ||
-      initJson?.PaymentUrl || initJson?.PaymentURL || initJson?.data?.RedirectURL;
-
+    const redirectUrl = initJson?.RedirectURL || initJson?.redirectURL || initJson?.RedirectUrl;
     if (!redirectUrl) {
-      console.error('InitializeEPS missing RedirectURL:', JSON.stringify(initJson).slice(0, 500));
-      return new Response(JSON.stringify({ error: 'EPS did not return a redirect URL', details: initJson }), {
+      console.error('InitializeEPS missing RedirectURL:', JSON.stringify(initJson).slice(0, 600));
+      return new Response(JSON.stringify({ error: 'EPS did not return RedirectURL', details: initJson }), {
         status: 502, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       });
     }
 
-    return new Response(JSON.stringify({ success: true, redirectUrl, raw: initJson }), {
+    return new Response(JSON.stringify({
+      success: true,
+      redirectUrl,
+      merchantTransactionId,
+      epsTransactionId: initJson?.TransactionId || initJson?.transactionId || null,
+    }), {
       status: 200, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
   } catch (err: any) {
-    console.error('eps-initiate error:', err);
+    console.error('eps-initiate error:', err?.message || err);
     return new Response(JSON.stringify({ error: err?.message || 'Internal error' }), {
       status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     });
