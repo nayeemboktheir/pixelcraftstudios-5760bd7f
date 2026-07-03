@@ -1,0 +1,21 @@
+# SPA routing (React Router) for Hostinger (Apache/LiteSpeed)
+# Ensures direct links like /product/... and /lp/... open correctly.
+
+# Fallback: treat 404s as SPA entry (works even if mod_rewrite is limited)
+ErrorDocument 404 /index.html
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # If your site is installed in a subfolder, change this, e.g. /shop/
+  RewriteBase /
+
+  # Don’t rewrite real files/folders
+  RewriteRule ^index\.html$ - [L]
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+
+  # Rewrite everything else to SPA entry
+  RewriteRule ^ index.html [L]
+</IfModule>
